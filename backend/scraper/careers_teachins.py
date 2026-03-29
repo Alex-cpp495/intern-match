@@ -1,0 +1,242 @@
+"""
+UNNC Careers 企业宣讲会爬虫
+数据来源：https://careers.nottingham.edu.cn/teachin
+页面通过 Base64+zlib 压缩嵌入 JS，需先解码再解析 HTML。
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import re
+import time
+import zlib
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import requests
+from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
+
+BASE_URL = "https://careers.nottingham.edu.cn"
+LIST_URL = BASE_URL + "/teachin"
+PAGE_URL_TPL = (
+    BASE_URL
+    + "/teachin/index/ddo/careers.nottingham.edu.cn/domain/careersatunnc/page/{page}"
+)
+CACHE_FILE = Path(__file__).parent.parent / "data" / "careers_teachins.json"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+MAX_PAGES = 10
+
+
+def _fetch_page(page: int, retries: int = 2) -> Optional[str]:
+    url = LIST_URL if page == 1 else PAGE_URL_TPL.format(page=page)
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp.encoding = "utf-8"
+            if resp.status_code == 200:
+                return resp.text
+            logger.warning("宣讲会列表第 %d 页返回 %d", page, resp.status_code)
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(1.5)
+            else:
+                logger.warning("宣讲会列表第 %d 页获取失败: %s", page, e)
+    return None
+
+
+def _decode_js_content(html_text: str) -> str:
+    """解码页面中 Base64 + zlib 压缩的嵌入内容。"""
+    soup = BeautifulSoup(html_text, "lxml")
+    for script in soup.find_all("script"):
+        s = script.string
+        if not s:
+            continue
+        m = re.search(r'unzip\("([A-Za-z0-9+/=]+)"\)', s)
+        if not m:
+            continue
+        encoded = m.group(1)
+        subs = re.findall(r"\.substr\((\d+)\)", s)
+        try:
+            raw = base64.b64decode(encoded)
+            decompressed = zlib.decompress(raw, 15).decode("utf-8", errors="replace")
+            s1 = int(subs[0]) if subs else 0
+            after_sub1 = decompressed[s1:]
+            decoded_bytes = base64.b64decode(after_sub1)
+            html_content = decoded_bytes.decode("utf-8", errors="replace")
+            s2 = int(subs[1]) if len(subs) > 1 else 0
+            return html_content[s2:]
+        except Exception:
+            continue
+    return ""
+
+
+def _parse_time_field(raw: str) -> dict:
+    """解析宣讲会的时间文本，格式如 '2026-04-22 18:30-20:00（周三）'。"""
+    raw = re.sub(r"\s+", " ", raw).strip()
+    result = {"date_start": "", "date_end": "", "time_start": "", "time_end": ""}
+
+    m_range = re.match(
+        r"(\d{4}-\d{2}-\d{2})\s*[—~～\-]\s*(\d{4}-\d{2}-\d{2})", raw
+    )
+    if m_range:
+        result["date_start"] = m_range.group(1)
+        result["date_end"] = m_range.group(2)
+        return result
+
+    m_single = re.match(
+        r"(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})-(\d{1,2}:\d{2})", raw
+    )
+    if m_single:
+        result["date_start"] = m_single.group(1)
+        result["date_end"] = m_single.group(1)
+        result["time_start"] = m_single.group(2)
+        result["time_end"] = m_single.group(3)
+        return result
+
+    m_dt = re.match(r"(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})", raw)
+    if m_dt:
+        result["date_start"] = m_dt.group(1)
+        result["date_end"] = m_dt.group(1)
+        result["time_start"] = m_dt.group(2)
+        return result
+
+    m_date = re.search(r"(\d{4}-\d{2}-\d{2})", raw)
+    if m_date:
+        result["date_start"] = m_date.group(1)
+        result["date_end"] = m_date.group(1)
+
+    return result
+
+
+def _parse_list_html(decoded_html: str) -> list[dict]:
+    soup = BeautifulSoup(decoded_html, "lxml")
+    items: list[dict] = []
+    for ul in soup.select("ul.infoList.teachinList"):
+        title_li = ul.select_one("li.span8")
+        if not title_li:
+            continue
+        title_a = title_li.select_one("a")
+        if not title_a:
+            continue
+        title = (title_a.get("title") or title_a.get_text(strip=True)).strip()
+        href = title_a.get("href", "")
+        link = href if href.startswith("http") else BASE_URL + href
+
+        status_el = title_li.select_one("span.status-text")
+        status = status_el.get_text(strip=True) if status_el else ""
+
+        loc_el = ul.select_one("li.span5")
+        location = loc_el.get_text(strip=True) if loc_el else ""
+
+        # 时间是第三个 li（无特定 class）
+        all_li = ul.find_all("li", recursive=False)
+        time_raw = all_li[2].get_text(strip=True) if len(all_li) >= 3 else ""
+        time_info = _parse_time_field(time_raw)
+
+        item_id = ""
+        id_match = re.search(r"/id/(\d+)", href)
+        if id_match:
+            item_id = id_match.group(1)
+
+        items.append(
+            {
+                "id": item_id,
+                "title": title,
+                "location": location,
+                "link": link,
+                "status": status,
+                "type": "teachin",
+                **time_info,
+            }
+        )
+    return items
+
+
+def scrape_careers_teachins(max_pages: int = MAX_PAGES) -> list[dict]:
+    logger.info("开始爬取 Careers 宣讲会，最多 %d 页...", max_pages)
+    all_items: list[dict] = []
+    prev_ids: set[str] = set()
+
+    for page in range(1, max_pages + 1):
+        html = _fetch_page(page)
+        if not html:
+            logger.warning("第 %d 页获取失败，停止", page)
+            break
+        decoded = _decode_js_content(html)
+        if not decoded:
+            logger.warning("第 %d 页解码失败，停止", page)
+            break
+        page_items = _parse_list_html(decoded)
+        if not page_items:
+            logger.info("第 %d 页无数据，停止", page)
+            break
+
+        cur_ids = {it["id"] for it in page_items if it["id"]}
+        if cur_ids and cur_ids == prev_ids:
+            logger.info("第 %d 页与上一页重复，停止翻页", page)
+            break
+        prev_ids = cur_ids
+
+        all_items.extend(page_items)
+        logger.info(
+            "第 %d 页获取到 %d 条宣讲会，累计 %d 条",
+            page,
+            len(page_items),
+            len(all_items),
+        )
+        time.sleep(0.8)
+
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for item in all_items:
+        key = item.get("id") or (item["title"] + item["date_start"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+
+    logger.info("Careers 宣讲会爬取完成，共 %d 条", len(unique))
+    return unique
+
+
+# ─────────────────────────────────────────
+# 缓存管理
+# ─────────────────────────────────────────
+
+
+def refresh_teachins_cache() -> list[dict]:
+    items = scrape_careers_teachins()
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": datetime.now().isoformat(),
+        "count": len(items),
+        "teachins": items,
+    }
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    logger.info("Careers 宣讲会缓存已更新：%s，共 %d 条", CACHE_FILE, len(items))
+    return items
+
+
+def get_cached_teachins() -> list[dict]:
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("teachins", [])
+        except Exception:
+            pass
+    return refresh_teachins_cache()

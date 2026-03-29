@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: intern-match-api
+    runtime: python
+    region: singapore
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    envVars:
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: AUTH_COOKIE_SECURE
+        value: "1"
+      - key: SKIP_EMBEDDER_WARMUP
+        value: "1"
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: ALLOWED_ORIGINS
+        sync: false
+    disk:
+      name: backend-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1

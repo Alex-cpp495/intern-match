@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+.env.local
+.env.production
+
+# Data / Cache
+backend/data/jobs_cache.json
+backend/data/app.db
+backend/data/wechat_articles.json
+backend/data/*.json
+backend/data/*.db
+
+# Scraper temp output
+sogou_weixin_results.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
