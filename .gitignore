@@ -19,6 +19,7 @@ backend/data/app.db
 backend/data/wechat_articles.json
 backend/data/*.json
 backend/data/*.db
+backend/data/wxmp_token.txt
 
 # Scraper temp output
 sogou_weixin_results.*

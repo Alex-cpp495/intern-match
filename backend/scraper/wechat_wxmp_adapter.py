@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 COOKIES_FILE = DATA_DIR / "wxmp_cookies.json"
+TOKEN_FILE = DATA_DIR / "wxmp_token.txt"
 ARTICLES_CACHE = DATA_DIR / "wechat_articles.json"
 
 _ACCOUNTS_TO_MONITOR: list[str] = [
@@ -91,6 +92,46 @@ def _article_html_to_text(url: str) -> str:
         return ""
 
 
+def _save_token(token: str) -> None:
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(token.strip(), encoding="utf-8")
+
+
+def _load_token() -> str | None:
+    if TOKEN_FILE.exists():
+        t = TOKEN_FILE.read_text(encoding="utf-8").strip()
+        if t:
+            return t
+    return None
+
+
+def _create_api() -> Any:
+    """创建 WxMPAPI 实例并确保 token 可用。"""
+    cookies = _load_cookies()
+    if not cookies:
+        raise RuntimeError("wxmp cookies 未配置")
+
+    from wxmp import WxMPAPI
+
+    api = WxMPAPI(cookies)
+
+    saved_token = _load_token()
+    if saved_token:
+        api.token = saved_token
+
+    if not api.token:
+        try:
+            api._fetch_token()
+            if api.token:
+                _save_token(api.token)
+                logger.info("wxmp: 自动获取 token 成功: %s", api.token)
+        except Exception as e:
+            logger.warning("wxmp: 自动获取 token 失败: %s", e)
+            raise
+
+    return api
+
+
 def is_wxmp_available() -> bool:
     """检查 wxmp cookies 是否存在且 wxmp 库可用。"""
     cookies = _load_cookies()
@@ -104,6 +145,55 @@ def is_wxmp_available() -> bool:
         return False
 
 
+def _raw_search_biz(api: Any, query: str) -> list[dict]:
+    """直接调用搜索接口，绕过 wxmp 库的模型验证。"""
+    resp = api.session.get(
+        "https://mp.weixin.qq.com/cgi-bin/searchbiz",
+        params={
+            "action": "search_biz",
+            "begin": 0,
+            "count": 5,
+            "query": query,
+            "token": api.token,
+        },
+        headers=api.headers,
+        cookies=api.cookies,
+        verify=False,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("base_resp", {}).get("ret") != 0:
+        raise RuntimeError(f"searchbiz 失败: {data}")
+    return data.get("list", [])
+
+
+def _raw_fetch_articles(api: Any, fakeid: str, begin: int = 0, count: int = 5) -> list[dict]:
+    """直接调用文章列表接口，绕过 wxmp 库的模型验证。"""
+    resp = api.session.get(
+        "https://mp.weixin.qq.com/cgi-bin/appmsg",
+        params={
+            "action": "list_ex",
+            "begin": begin,
+            "count": count,
+            "fakeid": fakeid,
+            "type": "9",
+            "query": "",
+            "token": api.token,
+            "lang": "zh_CN",
+            "f": "json",
+            "ajax": "1",
+        },
+        headers=api.headers,
+        cookies=api.cookies,
+        verify=False,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("base_resp", {}).get("ret") != 0:
+        raise RuntimeError(f"appmsg 失败: {data}")
+    return data.get("app_msg_list", [])
+
+
 def check_wxmp_session_valid() -> dict[str, Any]:
     """
     检查当前 wxmp session 是否有效。
@@ -113,10 +203,9 @@ def check_wxmp_session_valid() -> dict[str, Any]:
     if not cookies:
         return {"valid": False, "message": "Cookie 文件不存在，请扫码登录"}
     try:
-        from wxmp import WxMPAPI
-        api = WxMPAPI(cookies)
-        resp = api.fetch_fakeid("test")
-        return {"valid": True, "message": "Session 有效"}
+        api = _create_api()
+        results = _raw_search_biz(api, "test")
+        return {"valid": True, "message": f"Session 有效 (token={api.token})"}
     except Exception as e:
         msg = str(e)
         if "token" in msg.lower() or "login" in msg.lower() or "expired" in msg.lower():
@@ -134,31 +223,25 @@ def fetch_articles_via_wxmp(
 
     返回与 wechat_articles.py 兼容的 article dict 列表。
     """
-    cookies = _load_cookies()
-    if not cookies:
-        raise RuntimeError("wxmp cookies 未配置，无法获取文章")
-
-    from wxmp import WxMPAPI
-
-    api = WxMPAPI(cookies)
+    api = _create_api()
     target_accounts = accounts or _ACCOUNTS_TO_MONITOR
     all_articles: list[dict[str, Any]] = []
 
     for account_name in target_accounts:
         logger.info("wxmp: 搜索公众号「%s」...", account_name)
         try:
-            search_resp = api.fetch_fakeid(account_name)
+            results = _raw_search_biz(api, account_name)
         except Exception as e:
             logger.warning("wxmp: 搜索「%s」失败: %s", account_name, e)
             continue
 
-        if not search_resp.arr:
+        if not results:
             logger.warning("wxmp: 未找到公众号「%s」", account_name)
             continue
 
-        biz = search_resp.arr[0]
-        fakeid = biz.fakeid
-        nickname = biz.nickname
+        biz = results[0]
+        fakeid = biz.get("fakeid", "")
+        nickname = biz.get("nickname", account_name)
         logger.info("wxmp: 找到「%s」(fakeid=%s)，开始拉取文章...", nickname, fakeid[:8])
 
         begin = 0
@@ -167,7 +250,7 @@ def fetch_articles_via_wxmp(
 
         while fetched < max_articles_per_account:
             try:
-                articles_resp = api.fetch_articles(fakeid, begin=begin, count=count)
+                items = _raw_fetch_articles(api, fakeid, begin=begin, count=count)
             except Exception as e:
                 logger.warning(
                     "wxmp: 拉取「%s」文章失败 (begin=%d): %s",
@@ -175,15 +258,14 @@ def fetch_articles_via_wxmp(
                 )
                 break
 
-            items = articles_resp.app_msg_list if hasattr(articles_resp, "app_msg_list") else []
             if not items:
                 break
 
             for item in items:
-                title = getattr(item, "title", "") or ""
-                link = getattr(item, "link", "") or ""
-                create_time = getattr(item, "create_time", 0) or 0
-                cover = getattr(item, "cover", "") or ""
+                title = (item.get("title") or "").strip()
+                link = (item.get("link") or "").strip()
+                create_time = item.get("create_time", 0)
+                cover = (item.get("cover") or "").strip()
 
                 pub_date = ""
                 if create_time:
@@ -198,7 +280,7 @@ def fetch_articles_via_wxmp(
                     time.sleep(0.3)
 
                 article = {
-                    "title": title.strip(),
+                    "title": title,
                     "date": pub_date,
                     "publish_date": pub_date,
                     "summary": content[:200] if content else "",
