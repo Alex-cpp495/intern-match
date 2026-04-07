@@ -113,7 +113,24 @@ app = FastAPI(
 )
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "").strip()
-_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()] if _raw_origins else ["*"]
+if os.environ.get("APP_ENV", "").lower() in ("production", "prod") and not _raw_origins:
+    raise RuntimeError(
+        "APP_ENV=production 时必须设置 ALLOWED_ORIGINS（逗号分隔的前端 HTTPS 域名，例如 https://app.example.com）"
+    )
+
+if _raw_origins:
+    _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+else:
+    # 避免 allow_credentials=True 时与 Origin: * 组合带来的浏览器与安全策略问题
+    _allowed_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+    ]
+    logger.warning(
+        "ALLOWED_ORIGINS 未设置：仅允许本地默认前端源 %s。生产环境请设置 ALLOWED_ORIGINS。",
+        _allowed_origins,
+    )
 
 app.add_middleware(
     CORSMiddleware,
