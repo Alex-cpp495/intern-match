@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse, urlunparse
@@ -616,23 +616,107 @@ def scrape_multi_query_articles(
 # 缓存管理
 # ─────────────────────────────────────────────
 
+
+def _normalize_article_title(title: str) -> str:
+    t = (title or "").strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _article_merge_key(article: dict) -> tuple[str, str]:
+    """
+    合并用主键：(规范化标题, 搜索关键词)。
+    同一关键词下标题相同则视为同一条；不同关键词下同题文章保留多条。
+    """
+    t = _normalize_article_title(str(article.get("title", "")))
+    if not t:
+        link = str(article.get("sogou_link") or article.get("wechat_url") or "").strip()
+        t = link[:240] if link else "__empty__"
+    sq = str(article.get("search_query") or article.get("account") or "").strip()
+    return (t, sq)
+
+
+def merge_wechat_article_lists(previous: list[dict], incoming: list[dict]) -> list[dict]:
+    """
+    将本次抓取结果并入已有缓存：同 merge_key 时以 incoming 覆盖 previous（新数据优先）。
+    未出现在 incoming 中的旧条目保留，避免某关键词被反爬清空时丢光历史数据。
+    """
+    merged: dict[tuple[str, str], dict] = {}
+    for a in previous:
+        if not isinstance(a, dict):
+            continue
+        merged[_article_merge_key(a)] = a
+    for a in incoming:
+        if not isinstance(a, dict):
+            continue
+        merged[_article_merge_key(a)] = a
+    return list(merged.values())
+
+
+def _load_wechat_cache_file() -> tuple[list[dict], dict | None]:
+    """读取磁盘缓存：返回 (articles, 原始 JSON dict 或 None)。"""
+    if not CACHE_FILE.exists():
+        return [], None
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return [], None
+        raw = data.get("articles", [])
+        articles = raw if isinstance(raw, list) else []
+        return articles, data
+    except Exception as e:
+        logger.warning("读取 wechat 缓存文件失败，将视为无旧缓存: %s", e)
+        return [], None
+
+
 def refresh_wechat_cache(fetch_content: bool = True) -> list[dict]:
-    """重新爬取所有关键词并更新缓存文件"""
+    """
+    重新爬取所有关键词，与已有缓存增量合并后写入文件。
+    若整次爬取为空或抛错且磁盘上已有数据，则保留旧缓存且不覆盖文件（避免反爬/闪退丢数据）。
+    """
     effective = get_effective_search_queries()
-    articles = scrape_multi_query_articles(queries=effective, fetch_content=fetch_content)
+    prev_articles, _prev_raw = _load_wechat_cache_file()
+
+    try:
+        new_articles = scrape_multi_query_articles(queries=effective, fetch_content=fetch_content)
+    except Exception:
+        logger.exception("微信公众号爬取失败")
+        if prev_articles:
+            logger.warning(
+                "保留上次成功缓存，共 %d 篇（未写入）",
+                len(prev_articles),
+            )
+            return prev_articles
+        raise
+
+    if not new_articles and prev_articles:
+        logger.warning(
+            "本次爬取结果为空（可能被反爬或网络异常），保留磁盘缓存 %d 篇，不覆盖文件",
+            len(prev_articles),
+        )
+        return prev_articles
+
+    merged = merge_wechat_article_lists(prev_articles, new_articles)
     CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "updated_at": datetime.now().isoformat(),
-        "count": len(articles),
+        "count": len(merged),
         "queries": [q["query"] for q in effective],
         "builtin_queries": [q["query"] for q in SEARCH_QUERIES],
         "custom_queries": load_custom_queries(),
-        "articles": articles,
+        "articles": merged,
     }
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
-    logger.info(f"缓存已更新：{CACHE_FILE}，共 {len(articles)} 篇")
-    return articles
+    logger.info(
+        "缓存已更新：%s，合并后 %d 篇（本次抓取 %d 篇，合并前旧缓存 %d 篇）",
+        CACHE_FILE,
+        len(merged),
+        len(new_articles),
+        len(prev_articles),
+    )
+    return merged
 
 
 def repair_wechat_urls_from_cache() -> list[dict]:
