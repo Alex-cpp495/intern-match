@@ -23,7 +23,8 @@ PyJWT>=2.8.0,<3
 langgraph>=1.0,<2
 langchain-openai>=1.0,<2
 langchain-core>=1.0,<2
-
-# 可选：chyroc/wechatsogou（搜狗微信）；需 cachelib 顶替已移除的 werkzeug.contrib.cache
+# 微信公众平台后台 API（替代搜狗爬虫的主数据源）
+wxmp>=2.5.0,<3
+# 可选：chyroc/wechatsogou（搜狗微信 fallback）；需 cachelib 顶替已移除的 werkzeug.contrib.cache
 cachelib>=0.13,<1
 wechatsogou==4.5.4

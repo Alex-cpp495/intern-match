@@ -410,3 +410,53 @@ async def repair_article_wechat_links(background_tasks: BackgroundTasks):
     """不重爬列表，仅根据已有 sogou_link 补全 wechat_url（供正文抓取等）；阅读原文请用 /articles/open-sogou"""
     background_tasks.add_task(repair_wechat_urls_from_cache)
     return {"message": "微信公众号链接修复已在后台启动，完成后刷新页面即可"}
+
+
+# ─── wxmp 管理端点 ───
+
+
+@router.get("/wxmp/status")
+async def wxmp_status():
+    """检查 wxmp（微信公众平台后台 API）的可用状态。"""
+    from scraper.wechat_wxmp_adapter import is_wxmp_available, check_wxmp_session_valid
+
+    available = is_wxmp_available()
+    if not available:
+        return {
+            "available": False,
+            "session_valid": False,
+            "message": "wxmp 未配置（Cookie 文件不存在或 wxmp 库未安装），数据将 fallback 到搜狗爬虫",
+        }
+    session_info = await asyncio.to_thread(check_wxmp_session_valid)
+    return {
+        "available": True,
+        "session_valid": session_info["valid"],
+        "message": session_info["message"],
+    }
+
+
+class WxmpCookiesBody(BaseModel):
+    cookies: dict = Field(..., description="微信公众平台 Cookie（JSON 对象，键值对形式）")
+
+
+@router.post("/wxmp/cookies")
+async def set_wxmp_cookies(body: WxmpCookiesBody):
+    """
+    保存微信公众平台 Cookie。
+
+    获取方式：
+    1. 浏览器登录 https://mp.weixin.qq.com
+    2. F12 → Application → Cookies → 复制所有 cookie 为 JSON
+    约 4 天后过期需重新获取。
+    """
+    import json as _json
+    from scraper.wechat_wxmp_adapter import COOKIES_FILE, DATA_DIR
+
+    if not body.cookies or not isinstance(body.cookies, dict):
+        raise HTTPException(status_code=400, detail="cookies 必须是非空 JSON 对象")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+        _json.dump(body.cookies, f, ensure_ascii=False, indent=2)
+    logger.info("wxmp cookies 已保存到 %s", COOKIES_FILE)
+    return {"message": "Cookie 已保存，可调用 GET /api/wxmp/status 验证是否生效"}

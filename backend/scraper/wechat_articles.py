@@ -1,9 +1,11 @@
 """
 微信公众号文章爬虫（多关键词版）
-数据来源：搜狗微信搜索（weixin.sogou.com）
-流程：搜狗搜索列表 → 同 Session 跟进跳转链接 → 微信文章原页面正文
 
-支持配置多组搜索关键词，分别爬取后合并缓存。
+数据源优先级：
+  1. wxmp — 微信公众平台后台 API（需扫码登录获取 Cookie，约 4 天有效）
+  2. 搜狗微信搜索（weixin.sogou.com） — wxmp 不可用时自动 fallback
+
+wxmp 优势：全量历史文章、完整正文、精确发布时间、无验证码。
 """
 
 from __future__ import annotations
@@ -672,36 +674,57 @@ def _load_wechat_cache_file() -> tuple[list[dict], dict | None]:
 
 def refresh_wechat_cache(fetch_content: bool = True) -> list[dict]:
     """
-    重新爬取所有关键词，与已有缓存增量合并后写入文件。
-    若整次爬取为空或抛错且磁盘上已有数据，则保留旧缓存且不覆盖文件（避免反爬/闪退丢数据）。
+    刷新文章缓存。策略：
+      1. 优先用 wxmp（微信公众平台后台 API）
+      2. wxmp 不可用或失败时，fallback 到搜狗爬虫
+    抓取结果与已有缓存增量合并。
+    若整次抓取为空或抛错且磁盘上已有数据，则保留旧缓存（避免数据丢失）。
     """
+    from scraper.wechat_wxmp_adapter import refresh_articles_via_wxmp
+
     effective = get_effective_search_queries()
     prev_articles, _prev_raw = _load_wechat_cache_file()
 
-    try:
-        new_articles = scrape_multi_query_articles(queries=effective, fetch_content=fetch_content)
-    except Exception:
-        logger.exception("微信公众号爬取失败")
-        if prev_articles:
-            logger.warning(
-                "保留上次成功缓存，共 %d 篇（未写入）",
-                len(prev_articles),
-            )
-            return prev_articles
-        raise
+    new_articles: list[dict] | None = None
+    data_source = "unknown"
+
+    wxmp_result = refresh_articles_via_wxmp(fetch_content=fetch_content)
+    if wxmp_result is not None and len(wxmp_result) > 0:
+        new_articles = wxmp_result
+        data_source = "wxmp"
+        logger.info("使用 wxmp 获取了 %d 篇文章", len(new_articles))
+    else:
+        if wxmp_result is None:
+            logger.info("wxmp 不可用，fallback 到搜狗爬虫")
+        else:
+            logger.warning("wxmp 返回 0 篇文章，fallback 到搜狗爬虫")
+
+        try:
+            new_articles = scrape_multi_query_articles(queries=effective, fetch_content=fetch_content)
+            data_source = "sogou"
+        except Exception:
+            logger.exception("搜狗微信爬取失败")
+            if prev_articles:
+                logger.warning(
+                    "保留上次成功缓存，共 %d 篇（未写入）",
+                    len(prev_articles),
+                )
+                return prev_articles
+            raise
 
     if not new_articles and prev_articles:
         logger.warning(
-            "本次爬取结果为空（可能被反爬或网络异常），保留磁盘缓存 %d 篇，不覆盖文件",
+            "本次抓取结果为空（可能被反爬或网络异常），保留磁盘缓存 %d 篇，不覆盖文件",
             len(prev_articles),
         )
         return prev_articles
 
-    merged = merge_wechat_article_lists(prev_articles, new_articles)
+    merged = merge_wechat_article_lists(prev_articles, new_articles or [])
     CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "updated_at": datetime.now().isoformat(),
         "count": len(merged),
+        "data_source": data_source,
         "queries": [q["query"] for q in effective],
         "builtin_queries": [q["query"] for q in SEARCH_QUERIES],
         "custom_queries": load_custom_queries(),
@@ -710,10 +733,11 @@ def refresh_wechat_cache(fetch_content: bool = True) -> list[dict]:
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     logger.info(
-        "缓存已更新：%s，合并后 %d 篇（本次抓取 %d 篇，合并前旧缓存 %d 篇）",
+        "缓存已更新 (via %s)：%s，合并后 %d 篇（本次抓取 %d 篇，合并前旧缓存 %d 篇）",
+        data_source,
         CACHE_FILE,
         len(merged),
-        len(new_articles),
+        len(new_articles or []),
         len(prev_articles),
     )
     return merged

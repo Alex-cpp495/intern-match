@@ -1,14 +1,20 @@
 """
-从微信公众号文章正文中用正则抽取结构化活动信息，写入 wechat_events.json。
+从微信公众号文章正文中抽取结构化活动信息，写入 wechat_events.json。
 供合并日历与学生资讯「公众号活动」筛选使用。
 
-不依赖 AI，纯规则抽取：速度快、日期准确、无幻觉。
+活动判定策略（双引擎）：
+  1. DeepSeek AI 分类（需 DEEPSEEK_API_KEY）：把标题 + 正文摘要发给 AI，
+     返回 is_event + categories + location，准确率高、无需维护关键词表。
+  2. 正则关键词 fallback（无 API Key 或 AI 调用失败时）：基于关键词快速分类。
+
+日期/时间始终用正则提取（速度快、零幻觉）。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -91,18 +97,108 @@ _PAT_TIME = re.compile(r"(\d{1,2})[:\：点](\d{2})(?!\d)")
 _EVENT_TITLE_KEYWORDS = frozenset([
     "activity", "lecture", "workshop", "recruitment", "招新", "讲座",
     "活动", "工作坊", "比赛", "拾味", "正念", "t台", "open day", "开放日",
-    "招生", "宣讲", "招募", "面试", "比赛", "展", "论坛", "峰会",
-    "orientation", "seminar", "fair", "招聘会",
+    "宣讲会", "招募", "面试", "展", "论坛", "峰会", "市集",
+    "orientation", "seminar", "fair", "招聘会", "研讨会", "挑战赛",
+    "教育周", "说明会",
 ])
 _NON_EVENT_TITLE_KEYWORDS = frozenset([
     "回顾", "review", "总结", "报告", "通讯", "newsletter", "招生简章",
     "名单公布", "介绍", "introduction", "在职硕士", "博士招生", "毕业生",
-    "校友", "科普", "了解", "知识", "指南",
+    "校友", "科普", "了解", "知识", "指南", "全攻略", "大盘点",
+    "榜单", "分数线", "录取", "大动作",
 ])
 
 
 # ---------------------------------------------------------------------------
-# 核心函数
+# DeepSeek AI 活动分类
+# ---------------------------------------------------------------------------
+
+_DEEPSEEK_CLASSIFY_PROMPT = """你是一个校园活动识别助手。给你一篇微信公众号文章的标题和正文摘要，请判断这篇文章是否在宣传一个**具体的、有明确举办时间的线下/线上活动**。
+
+活动的例子：讲座、工作坊、招聘会、宣讲会、比赛、开放日、社团招新、市集、研讨会等。
+**不是**活动的例子：新闻报道、政策通知、招生简章、科普文章、经验分享、榜单公布、回顾总结、毕业典礼合影、课程介绍。
+
+请以 JSON 格式回答，不要输出 JSON 以外的任何内容：
+{
+  "is_event": true/false,
+  "categories": ["讲座"/"招新"/"社团活动"/"校园活动"/"招聘会"/"宣讲会"/"比赛"/"工作坊"/"其他"],
+  "location": "活动地点（如果文中提到，否则留空字符串）",
+  "confidence": 0.0-1.0
+}"""
+
+
+def _classify_with_deepseek(title: str, content_snippet: str) -> dict[str, Any] | None:
+    """
+    用 DeepSeek 判断文章是否为活动。
+    返回 {"is_event": bool, "categories": list, "location": str} 或 None（失败）。
+    """
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        logger.debug("openai 库未安装，AI 分类不可用")
+        return None
+
+    user_msg = f"标题：{title}\n\n正文摘要（前500字）：\n{content_snippet[:500]}"
+
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        )
+        resp = client.chat.completions.create(
+            model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+            messages=[
+                {"role": "system", "content": _DEEPSEEK_CLASSIFY_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.1,
+            max_tokens=200,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        result = json.loads(raw)
+        return {
+            "is_event": bool(result.get("is_event", False)),
+            "categories": result.get("categories", []),
+            "location": str(result.get("location", "")),
+            "confidence": float(result.get("confidence", 0.0)),
+        }
+    except json.JSONDecodeError:
+        logger.warning("DeepSeek 返回非 JSON: %s", raw[:200] if raw else "(empty)")
+        return None
+    except Exception as e:
+        logger.warning("DeepSeek 分类调用失败: %s", e)
+        return None
+
+
+def _is_event_ai(title: str, content: str) -> tuple[bool, list[str], str]:
+    """
+    AI 判定 + 降级逻辑：
+      - 有 DEEPSEEK_API_KEY → 用 AI
+      - 无 key 或 AI 失败 → 用关键词 _is_event
+    返回 (is_event, categories, location)。
+    """
+    ai_result = _classify_with_deepseek(title, content)
+    if ai_result is not None:
+        cats = ai_result.get("categories", [])
+        if not isinstance(cats, list):
+            cats = []
+        return (
+            ai_result["is_event"],
+            cats[:3],
+            ai_result.get("location", ""),
+        )
+    is_evt = _is_event(title, content)
+    cats = _infer_categories(title, content) if is_evt else []
+    return is_evt, cats, ""
+
+
+# ---------------------------------------------------------------------------
+# 核心函数（正则层）
 # ---------------------------------------------------------------------------
 
 def _pub_year(article: dict[str, Any]) -> int | None:
@@ -333,8 +429,10 @@ def _load_articles() -> list[dict[str, Any]]:
 
 def refresh_wechat_events_cache() -> list[dict[str, Any]]:
     """
-    读取文章缓存，用正则逐篇提取活动信息，写出 wechat_events.json。
-    不需要 API Key，速度快，日期准确。
+    读取文章缓存，逐篇判定是否为活动并提取结构化信息。
+
+    活动判定：优先 DeepSeek AI（若配 DEEPSEEK_API_KEY），否则 fallback 关键词。
+    日期/时间：始终用正则（快速、零幻觉）。
     """
     articles = _load_articles()
     if not articles:
@@ -342,6 +440,7 @@ def refresh_wechat_events_cache() -> list[dict[str, Any]]:
         payload = {
             "updated_at": datetime.now().isoformat(),
             "count": 0,
+            "classifier": "none",
             "events": [],
         }
         EVENTS_CACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -349,18 +448,30 @@ def refresh_wechat_events_cache() -> list[dict[str, Any]]:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         return []
 
+    use_ai = bool(os.getenv("DEEPSEEK_API_KEY", "").strip())
+    classifier_name = "deepseek" if use_ai else "keywords"
+    logger.info(
+        "活动分类引擎: %s（共 %d 篇文章待处理）",
+        classifier_name, len(articles),
+    )
+
     events: list[dict[str, Any]] = []
     skipped_no_content = 0
     skipped_not_event = 0
+    ai_calls = 0
 
-    for art in articles:
+    for idx, art in enumerate(articles):
         title = (art.get("title") or "").strip()
         content = (art.get("content") or art.get("summary") or "").strip()
         if not title or len(content) < 20:
             skipped_no_content += 1
             continue
 
-        if not _is_event(title, content):
+        is_evt, cats, ai_location = _is_event_ai(title, content)
+        if use_ai:
+            ai_calls += 1
+
+        if not is_evt:
             skipped_not_event += 1
             continue
 
@@ -368,9 +479,11 @@ def refresh_wechat_events_cache() -> list[dict[str, Any]]:
         ds, de, pat = _extract_date(content, ref_year)
         ts, te = _extract_times(content)
         desc = _build_description(title, content)
-        cats = _infer_categories(title, content)
+        if not cats:
+            cats = _infer_categories(title, content)
 
         sogou = (art.get("sogou_link") or "").strip()
+        wechat_url = (art.get("wechat_url") or "").strip()
         account = (art.get("account") or "").strip()
 
         events.append(
@@ -380,26 +493,34 @@ def refresh_wechat_events_cache() -> list[dict[str, Any]]:
                 "date_end": de,
                 "time_start": ts,
                 "time_end": te,
-                "location": "",
+                "location": ai_location,
                 "description": desc,
                 "categories": cats,
                 "sogou_link": sogou,
+                "wechat_url": wechat_url,
                 "account": account,
                 "source_article_title": title,
-                "_date_pattern": pat,  # 调试用，不影响前端展示
+                "_date_pattern": pat,
+                "_classifier": classifier_name,
             }
         )
 
+        if (idx + 1) % 20 == 0:
+            logger.info("活动提取进度: %d/%d", idx + 1, len(articles))
+
     logger.info(
-        "公众号活动提取完成：共 %d 条活动，跳过无内容 %d 篇，跳过非活动 %d 篇",
+        "公众号活动提取完成 (via %s)：共 %d 条活动，跳过无内容 %d 篇，跳过非活动 %d 篇，AI 调用 %d 次",
+        classifier_name,
         len(events),
         skipped_no_content,
         skipped_not_event,
+        ai_calls,
     )
 
     payload = {
         "updated_at": datetime.now().isoformat(),
         "count": len(events),
+        "classifier": classifier_name,
         "events": events,
     }
     EVENTS_CACHE.parent.mkdir(parents=True, exist_ok=True)
