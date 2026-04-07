@@ -13,6 +13,7 @@ const SOURCES: MergedCalendarEvent["source"][] = [
   "careers_lecture",
   "careers_jobfair",
   "careers_teachin",
+  "wechat_event",
   "user_custom",
 ];
 

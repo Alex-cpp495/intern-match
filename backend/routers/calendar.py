@@ -15,6 +15,7 @@ import logging
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
@@ -39,6 +40,7 @@ from scraper.unnc_events import get_cached_events
 from scraper.careers_lectures import get_cached_lectures
 from scraper.careers_jobfairs import get_cached_jobfairs
 from scraper.careers_teachins import get_cached_teachins
+from scraper.wechat_event_extractor import get_cached_wechat_events
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -250,8 +252,67 @@ def _teachin_to_calendar(ti: dict) -> Optional[CalendarEvent]:
     )
 
 
+def _wechat_event_to_calendar(e: dict) -> Optional[CalendarEvent]:
+    title = (e.get("title") or "").strip()
+    if not title:
+        return None
+    date_start = (e.get("date_start") or "").strip()
+    date_end = (e.get("date_end") or date_start).strip()
+    time_start = (e.get("time_start") or "").strip()
+    time_end = (e.get("time_end") or "").strip()
+    sogou = (e.get("sogou_link") or "").strip()
+    url = f"/api/articles/open-sogou?url={quote(sogou, safe='')}" if sogou else ""
+
+    cats_raw = e.get("categories")
+    categories: list[str] = []
+    if isinstance(cats_raw, list):
+        categories = [str(c).strip() for c in cats_raw if str(c).strip()]
+    account = (e.get("account") or "").strip()
+    if account and account not in categories:
+        categories = [account] + categories
+
+    desc = (e.get("description") or "").strip()
+    start_iso: Optional[str] = None
+    end_iso: Optional[str] = None
+    all_day = False
+
+    if date_start:
+        ts = time_start or "09:00"
+        te = time_end or ts
+        try:
+            ds = datetime.strptime(f"{date_start} {ts}", "%Y-%m-%d %H:%M").replace(
+                tzinfo=DEFAULT_TZ
+            )
+            start_iso = ds.isoformat()
+            de = datetime.strptime(f"{date_end} {te}", "%Y-%m-%d %H:%M").replace(
+                tzinfo=DEFAULT_TZ
+            )
+            end_iso = de.isoformat()
+        except ValueError:
+            logger.debug("无法解析公众号活动时间: %s %s", date_start, ts)
+        all_day = not bool(time_start)
+    else:
+        all_day = True
+
+    uid_key_date = date_start or "nodate"
+    uid_key_time = time_start or (sogou[:48] if sogou else title[:48])
+    return CalendarEvent(
+        uid=_stable_uid(CalendarSource.WECHAT_EVENT, title, uid_key_date, uid_key_time),
+        title=title,
+        start_iso=start_iso,
+        end_iso=end_iso,
+        all_day=all_day,
+        busy=False,
+        source=CalendarSource.WECHAT_EVENT,
+        location=e.get("location") or "",
+        url=url,
+        description=desc,
+        categories=categories,
+    )
+
+
 def collect_merged_calendar_events() -> list[CalendarEvent]:
-    """官网活动 + Careers 讲座 + 招聘会 + 宣讲会 → 统一 CalendarEvent 列表。"""
+    """官网活动 + Careers + 微信公众号活动 → 统一 CalendarEvent 列表。"""
     events: list[CalendarEvent] = []
     for row in get_cached_events():
         ce = _unnc_event_to_calendar(row)
@@ -267,6 +328,10 @@ def collect_merged_calendar_events() -> list[CalendarEvent]:
             events.append(ce)
     for ti in get_cached_teachins():
         ce = _teachin_to_calendar(ti)
+        if ce:
+            events.append(ce)
+    for wx in get_cached_wechat_events():
+        ce = _wechat_event_to_calendar(wx)
         if ce:
             events.append(ce)
     events.sort(key=lambda e: e.start_iso or "")
@@ -314,7 +379,12 @@ def _build_merged_ics(events: list[CalendarEvent]) -> str:
         end = _parse_iso_to_aware(ev.end_iso) if ev.end_iso else None
         if not end or end <= start:
             end = start + timedelta(hours=1)
-        src = "官网" if ev.source == CalendarSource.UNNC_EVENTS else "Careers"
+        if ev.source == CalendarSource.UNNC_EVENTS:
+            src = "官网"
+        elif ev.source == CalendarSource.WECHAT_EVENT:
+            src = "公众号"
+        else:
+            src = "Careers"
         summary = _ics_escape(f"[{src}] {ev.title}", 900)
         loc = _ics_escape(ev.location or "", 500)
         desc = _ics_escape(ev.description or "", 1200)

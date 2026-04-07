@@ -19,6 +19,7 @@ def refresh_all_campus_caches() -> None:
     from scraper.careers_jobfairs import refresh_jobfairs_cache
     from scraper.careers_teachins import refresh_teachins_cache
     from scraper.wechat_articles import refresh_wechat_cache
+    from scraper.wechat_event_extractor import refresh_wechat_events_cache
 
     steps: list[tuple[str, Callable[[], Any]]] = [
         ("官网活动", refresh_events_cache),
@@ -26,6 +27,7 @@ def refresh_all_campus_caches() -> None:
         ("招聘会", refresh_jobfairs_cache),
         ("宣讲会", refresh_teachins_cache),
         ("微信公众号文章", refresh_wechat_cache),
+        ("公众号活动 AI 抽取", refresh_wechat_events_cache),
     ]
     for name, fn in steps:
         try:

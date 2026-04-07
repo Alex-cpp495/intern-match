@@ -28,6 +28,7 @@ export type CalendarSource =
   | "careers_lecture"
   | "careers_jobfair"
   | "careers_teachin"
+  | "wechat_event"
   | "ical_timetable"
   | "user_custom";
 
@@ -114,6 +115,8 @@ function sourceLabel(source: CalendarSource): string {
       return "宣讲会";
     case "unnc_events":
       return "官网";
+    case "wechat_event":
+      return "公众号";
     case "ical_timetable":
       return "课表";
     case "user_custom":
@@ -248,7 +251,8 @@ export function CampusActivityCalendar({
         </div>
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mt-2">
           <p className="text-[10px] text-slate-400">
-            数据：官网 {bySource.unnc_events ?? 0} 条 · Careers{" "}
+            数据：官网 {bySource.unnc_events ?? 0} 条 · 公众号活动{" "}
+            {bySource.wechat_event ?? 0} 条 · Careers{" "}
             {bySource.careers_lecture ?? 0} 条 · 招聘会{" "}
             {bySource.careers_jobfair ?? 0} 条 · 宣讲会{" "}
             {bySource.careers_teachin ?? 0} 条 · 个人课表{" "}

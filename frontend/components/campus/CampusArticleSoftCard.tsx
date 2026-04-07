@@ -31,6 +31,7 @@ const SOURCE_LABEL: Record<CalendarSource, string> = {
   careers_lecture: "就业讲座",
   careers_jobfair: "招聘会",
   careers_teachin: "企业宣讲",
+  wechat_event: "公众号活动",
   ical_timetable: "个人课表",
   user_custom: "自定义",
 };

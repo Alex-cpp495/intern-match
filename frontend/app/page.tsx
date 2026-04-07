@@ -825,7 +825,7 @@ function AuthenticatedHome({ user }: { user: AuthUser }) {
         schedule_text: p.schedule_text, major: p.major, grade: p.grade || "大二",
         skills: p.skills, interests: p.interests, has_project: p.has_project,
         intern_period: p.intern_period || "", preferences: p.preferences,
-      }, { timeout: 120000 });
+      }, { timeout: 300000 });
       saveProfile(uid, p as StoredProfile);
       saveLastMatch(uid, res.data, p);
       setSavedProfile(p as StoredProfile);

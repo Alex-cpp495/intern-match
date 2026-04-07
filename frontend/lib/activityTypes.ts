@@ -114,6 +114,7 @@ export function classifyActivity(ev: ClassifiableEvent): ActivityKind {
   }
 
   if (ev.source === "unnc_events") return "campus_event";
+  if (ev.source === "wechat_event") return "campus_event";
   if (ev.source === "careers_lecture") return "careers_other";
   return "other";
 }

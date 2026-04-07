@@ -126,3 +126,12 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/warmup")
+async def warmup():
+    """浏览器直接打开此地址即可预加载模型，展示前约等 1～3 分钟"""
+    import asyncio
+    from core.embedder import get_model
+    await asyncio.to_thread(get_model)
+    return {"status": "model_ready"}

@@ -24,6 +24,7 @@ class CalendarSource(StrEnum):
     CAREERS_TEACHIN = "careers_teachin"  # careers 企业宣讲会
     ICAL_TIMETABLE = "ical_timetable"  # 宁诺课表等 iCal 导入
     USER_CUSTOM = "user_custom"  # 用户手动添加
+    WECHAT_EVENT = "wechat_event"  # 微信公众号文章 AI 抽取的活动
 
 
 class CalendarEvent(BaseModel):

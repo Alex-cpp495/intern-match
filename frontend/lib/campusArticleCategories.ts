@@ -10,7 +10,8 @@ export type ActivityCategoryId =
   | "unnc_events"
   | "careers_lecture"
   | "careers_jobfair"
-  | "careers_teachin";
+  | "careers_teachin"
+  | "wechat_event";
 
 export const ACTIVITY_CATEGORY_OPTIONS: {
   id: ActivityCategoryId;
@@ -22,6 +23,7 @@ export const ACTIVITY_CATEGORY_OPTIONS: {
   { id: "careers_lecture", label: "就业讲座" },
   { id: "careers_jobfair", label: "招聘会" },
   { id: "careers_teachin", label: "企业宣讲" },
+  { id: "wechat_event", label: "公众号活动" },
 ];
 
 type CategorizableEvent = EventTimingFields & { source: CalendarSource };

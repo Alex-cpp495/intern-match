@@ -1,20 +1,32 @@
+import asyncio
 import logging
 from urllib.parse import urlparse, unquote
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
-from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel, Field
 from typing import Optional
 from scraper.unnc_events import get_cached_events, refresh_events_cache
 from scraper.wechat_articles import (
+    SEARCH_QUERIES,
+    add_custom_wechat_query,
     get_cached_articles,
+    get_effective_search_queries,
+    load_custom_queries,
+    proxy_wechat_html_from_sogou,
     refresh_wechat_cache,
+    remove_custom_wechat_query,
     repair_wechat_urls_from_cache,
+    resolve_fresh_wechat_url_from_sogou,
 )
 from scraper.careers_lectures import get_cached_lectures, refresh_careers_cache
 from scraper.careers_jobfairs import get_cached_jobfairs, refresh_jobfairs_cache
 from scraper.careers_teachins import get_cached_teachins, refresh_teachins_cache
 from scraper.campus_refresh import refresh_all_campus_caches
+from scraper.wechat_event_extractor import (
+    get_cached_wechat_events,
+    refresh_wechat_events_cache,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -28,7 +40,7 @@ async def refresh_all_campus(background_tasks: BackgroundTasks):
     """
     background_tasks.add_task(refresh_all_campus_caches)
     return {
-        "message": "校园活动数据已在后台刷新（官网 + Careers），完成后刷新页面或稍候再点刷新即可看到更新",
+        "message": "校园活动数据已在后台刷新（官网 + Careers + 微信文章 + 公众号活动 AI 抽取），完成后刷新页面或稍候再点刷新即可看到更新",
     }
 
 
@@ -82,6 +94,98 @@ class ArticleItem(BaseModel):
 class ArticlesResponse(BaseModel):
     articles: list[ArticleItem]
     total: int
+
+
+class WechatQueryRow(BaseModel):
+    query: str
+    label: str = ""
+    max_pages: int = 3
+
+
+class WechatSearchQueriesResponse(BaseModel):
+    """内置搜狗关键词 + 用户自定义关键词（合并后用于爬取）。"""
+
+    builtin: list[WechatQueryRow]
+    custom: list[WechatQueryRow]
+    effective_query_count: int
+
+
+class WechatCustomQueryBody(BaseModel):
+    query: str = Field(..., min_length=1, max_length=80, description="搜狗微信搜索关键词，如公众号名、学校名")
+    label: str = Field("", max_length=64, description="展示用标签，默认同关键词")
+    max_pages: int = Field(3, ge=1, le=10, description="该关键词最多翻页数")
+    refresh_articles_now: bool = Field(
+        False,
+        description="为 true 时在后台立即重爬全部关键词（含新增项，耗时较长）",
+    )
+
+
+def _row_from_cfg(q: dict) -> WechatQueryRow:
+    return WechatQueryRow(
+        query=str(q.get("query", "")),
+        label=str(q.get("label", q.get("query", "")) or q.get("query", "")),
+        max_pages=int(q.get("max_pages", 3)),
+    )
+
+
+class WechatEventItem(BaseModel):
+    title: str
+    date_start: str = ""
+    date_end: str = ""
+    time_start: str = ""
+    time_end: str = ""
+    location: str = ""
+    description: str = ""
+    categories: list[str] = []
+    sogou_link: str = ""
+    account: str = ""
+    source_article_title: str = ""
+
+
+class WechatEventsResponse(BaseModel):
+    events: list[WechatEventItem]
+    total: int
+
+
+def _wechat_event_item_from_dict(e: dict) -> WechatEventItem:
+    cats = e.get("categories")
+    if not isinstance(cats, list):
+        cats = []
+    return WechatEventItem(
+        title=str(e.get("title") or ""),
+        date_start=str(e.get("date_start") or ""),
+        date_end=str(e.get("date_end") or ""),
+        time_start=str(e.get("time_start") or ""),
+        time_end=str(e.get("time_end") or ""),
+        location=str(e.get("location") or ""),
+        description=str(e.get("description") or ""),
+        categories=[str(x) for x in cats if x is not None],
+        sogou_link=str(e.get("sogou_link") or ""),
+        account=str(e.get("account") or ""),
+        source_article_title=str(e.get("source_article_title") or ""),
+    )
+
+
+@router.get("/wechat-events", response_model=WechatEventsResponse)
+async def list_wechat_events():
+    """从缓存读取 AI 抽取的公众号活动（与合并日历同源）。"""
+    raw = get_cached_wechat_events()
+    items: list[WechatEventItem] = []
+    for e in raw:
+        if not isinstance(e, dict):
+            continue
+        try:
+            items.append(_wechat_event_item_from_dict(e))
+        except Exception:
+            logger.debug("跳过无效 wechat_event 条目", exc_info=True)
+    return WechatEventsResponse(events=items, total=len(items))
+
+
+@router.post("/wechat-events/refresh")
+async def refresh_wechat_events(background_tasks: BackgroundTasks):
+    """后台重新跑 DeepSeek 抽取（耗时与文章数成正比，需配置 DEEPSEEK_API_KEY）。"""
+    background_tasks.add_task(refresh_wechat_events_cache)
+    return {"message": "公众号活动 AI 抽取已在后台启动，完成后刷新校园页即可"}
 
 
 @router.get("/events", response_model=EventsResponse)
@@ -185,23 +289,106 @@ async def refresh_teachins(background_tasks: BackgroundTasks):
     return {"message": "宣讲会缓存刷新已在后台启动"}
 
 
+def _normalize_sogou_query_url(url: str) -> str:
+    raw = url.strip()
+    while True:
+        nxt = unquote(raw)
+        if nxt == raw:
+            break
+        raw = nxt
+    return raw
+
+
 @router.get("/articles/open-sogou")
-async def open_article_via_sogou(url: str = Query(..., min_length=24, max_length=4096)):
+async def open_article_via_sogou(url: str = Query(..., min_length=24, max_length=8192)):
     """
-    浏览器打开搜狗微信中转链，由搜狗页面 JS 生成短时 mp 链再跳转。
-    勿把缓存里的 mp?s?src=11&signature=... 直链给用户（会过期）；应优先走本接口。
+    代理模式：服务端用搜狗 cookie 获取微信文章 HTML，直接返回给浏览器。
+    避免 302 重定向后微信因 Referer 校验拒绝访问。
     """
-    raw = unquote(url).strip()
+    raw = _normalize_sogou_query_url(url)
     parsed = urlparse(raw)
     if parsed.scheme not in ("http", "https"):
         raise HTTPException(status_code=400, detail="invalid scheme")
     host = (parsed.hostname or "").lower()
     if host != "weixin.sogou.com":
         raise HTTPException(status_code=400, detail="invalid host")
-    path = parsed.path or ""
-    if "/link" not in path:
-        raise HTTPException(status_code=400, detail="invalid path")
-    return RedirectResponse(url=raw, status_code=302)
+    path_l = (parsed.path or "").lower()
+    q = parsed.query or ""
+    if "/link" not in path_l and "link" not in path_l and "url=" not in q:
+        raise HTTPException(status_code=400, detail="invalid sogou url")
+
+    try:
+        html = await asyncio.to_thread(proxy_wechat_html_from_sogou, raw)
+    except Exception as e:
+        logger.warning("open-sogou 代理异常: %s", e)
+        html = ""
+    if html:
+        return HTMLResponse(content=html, status_code=200)
+    return HTMLResponse(
+        content="<html><body><h2>无法加载文章，请稍后重试</h2>"
+        f'<p><a href="{raw}" target="_blank">尝试直接访问搜狗链接</a></p>'
+        "</body></html>",
+        status_code=502,
+    )
+
+
+@router.get("/articles/search-queries", response_model=WechatSearchQueriesResponse)
+async def get_article_search_queries():
+    """内置与自定义搜狗搜索关键词；合并后的总数见 effective_query_count。"""
+    custom_raw = load_custom_queries()
+    builtin = [_row_from_cfg(q) for q in SEARCH_QUERIES]
+    custom = [
+        _row_from_cfg(x)
+        for x in custom_raw
+        if isinstance(x, dict) and str(x.get("query", "")).strip()
+    ]
+    return WechatSearchQueriesResponse(
+        builtin=builtin,
+        custom=custom,
+        effective_query_count=len(get_effective_search_queries()),
+    )
+
+
+@router.post("/articles/custom-query")
+async def post_article_custom_query(
+    body: WechatCustomQueryBody,
+    background_tasks: BackgroundTasks,
+):
+    """新增自定义搜狗关键词；与内置列表去重合并，下次爬取时纳入。"""
+    try:
+        add_custom_wechat_query(
+            body.query.strip(),
+            (body.label or "").strip(),
+            body.max_pages,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if body.refresh_articles_now:
+        background_tasks.add_task(refresh_wechat_cache, True)
+        message = "已保存并已启动后台爬取微信文章，请数分钟后刷新本页查看。"
+    else:
+        message = "已保存。请点击本页右上角「刷新」以按新关键词爬取文章。"
+    custom_raw = load_custom_queries()
+    custom = [
+        _row_from_cfg(x)
+        for x in custom_raw
+        if isinstance(x, dict) and str(x.get("query", "")).strip()
+    ]
+    return {"message": message, "custom": custom}
+
+
+@router.delete("/articles/custom-query")
+async def delete_article_custom_query(
+    query: str = Query(..., min_length=1, max_length=80, description="要删除的关键词"),
+):
+    remove_custom_wechat_query(query)
+    custom_raw = load_custom_queries()
+    custom = [
+        _row_from_cfg(x)
+        for x in custom_raw
+        if isinstance(x, dict) and str(x.get("query", "")).strip()
+    ]
+    return {"message": "已删除", "custom": custom}
 
 
 @router.get("/articles", response_model=ArticlesResponse)

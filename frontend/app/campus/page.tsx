@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 import {
   ChevronLeft,
@@ -27,6 +27,7 @@ import {
   WechatArticleCard,
   type WechatArticle,
 } from "@/components/campus/WechatArticleCard";
+import { WechatCustomQueriesPanel } from "@/components/campus/WechatCustomQueriesPanel";
 import {
   ACTIVITY_CATEGORY_OPTIONS,
   type ActivityCategoryId,
@@ -76,6 +77,7 @@ const NON_TIMETABLE_SOURCES: CalendarSource[] = [
   "careers_lecture",
   "careers_jobfair",
   "careers_teachin",
+  "wechat_event",
   "user_custom",
 ];
 
@@ -225,6 +227,12 @@ export default function CampusPage() {
   const [hiddenUids, setHiddenUids] = useState<Set<string>>(new Set());
   const [loadingCalendar, setLoadingCalendar] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  /** 后台 refresh-all 后，公众号活动 AI 较慢，继续静默轮询合并日历 */
+  const mergePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const tabRef = useRef<TabKey>("articles");
+  useEffect(() => {
+    tabRef.current = tab;
+  }, [tab]);
   const [currentPage, setCurrentPage] = useState(1);
   const PAGE_SIZE = 18;
   const [customEvents, setCustomEvents] = useState<MergedCalendarEvent[]>([]);
@@ -288,6 +296,12 @@ export default function CampusPage() {
         if (Array.isArray(arr)) setHiddenUids(new Set(arr.map(String)));
       }
     } catch { /* ignore */ }
+    return () => {
+      if (mergePollRef.current) {
+        clearInterval(mergePollRef.current);
+        mergePollRef.current = null;
+      }
+    };
   }, [loadMergedCalendar]);
 
   /** 每个自然日首次打开本页时后台触发全量刷新（与后端定时任务互补），并延迟拉取合并日历 */
@@ -411,18 +425,38 @@ export default function CampusPage() {
   );
 
   const handleRefresh = async () => {
+    if (mergePollRef.current) {
+      clearInterval(mergePollRef.current);
+      mergePollRef.current = null;
+    }
     setRefreshing(true);
     setLoadingCalendar(true);
     try {
       await axios.post("/api/campus/refresh-all");
-      await new Promise((r) => setTimeout(r, 2500));
-      await loadMergedCalendar({ silent: true });
-      if (tab === "wechat") loadWechatArticles();
     } catch {
       await loadMergedCalendar({ silent: true });
+      setLoadingCalendar(false);
+      setRefreshing(false);
+      return;
     }
+    // 爬取 + 公众号活动 AI 逐篇调用需数分钟～十余分钟，不能只在 2～3 秒后拉一次日历
+    await new Promise((r) => setTimeout(r, 10_000));
+    await loadMergedCalendar({ silent: true });
+    if (tabRef.current === "wechat") loadWechatArticles();
     setLoadingCalendar(false);
     setRefreshing(false);
+
+    let ticks = 0;
+    const maxTicks = 24;
+    mergePollRef.current = setInterval(() => {
+      ticks += 1;
+      void loadMergedCalendar({ silent: true });
+      if (tabRef.current === "wechat") loadWechatArticles();
+      if (ticks >= maxTicks && mergePollRef.current) {
+        clearInterval(mergePollRef.current);
+        mergePollRef.current = null;
+      }
+    }, 25_000);
   };
 
   const filteredActivities = useMemo(() => {
@@ -488,6 +522,8 @@ export default function CampusPage() {
               聚合搜狗微信搜索中校园相关公众号的文章，点击可跳转阅读原文。
             </p>
           </header>
+
+          <WechatCustomQueriesPanel onAfterChange={loadWechatArticles} />
 
           <div className="flex flex-wrap gap-2 mb-6">
             <button
@@ -618,7 +654,7 @@ export default function CampusPage() {
             投资你的校园生活
           </h1>
           <p className="text-sm text-slate-500 mt-2 max-w-2xl leading-relaxed">
-            聚合官网活动、就业讲座、招聘会与企业宣讲会。按来源浏览，或切换到「活动日历」查看月视图。
+            聚合官网活动、就业讲座、招聘会、企业宣讲会与公众号活动。按来源浏览，或切换到「活动日历」查看月视图。
           </p>
         </header>
 
@@ -648,9 +684,33 @@ export default function CampusPage() {
         </div>
 
         {filteredActivities.length === 0 ? (
-          <div className="rounded-[1.75rem] bg-white/50 backdrop-blur-md border border-dashed border-stone-300/55 py-16 text-center text-slate-400">
+          <div className="rounded-[1.75rem] bg-white/50 backdrop-blur-md border border-dashed border-stone-300/55 py-16 text-center text-slate-400 px-4">
             <Newspaper size={40} className="mx-auto mb-3 opacity-35" />
-            <p className="text-sm">该分类下暂无内容，换个分类或点击刷新试试</p>
+            {category === "wechat_event" ? (
+              <div className="text-sm text-slate-500 max-w-lg mx-auto space-y-2">
+                <p>
+                  「公众号活动」由后台用 AI
+                  分析微信文章生成，不是点浏览器刷新就能立刻出现。
+                </p>
+                <p>
+                  请点击本页<strong>顶部 Tab 那一行最右侧</strong>的
+                  <strong>圆形箭头</strong>（鼠标悬停显示「刷新当前视图」），会触发全量后台任务；AI
+                  可能要 <strong>5～15 分钟</strong> 才写完数据。
+                </p>
+                <p className="text-xs text-slate-400">
+                  若久等仍为空：确认后端已配置 DEEPSEEK_API_KEY，并查看终端是否报错；也可在 PowerShell
+                  执行{" "}
+                  <code className="text-violet-700 bg-violet-50 px-1 rounded">
+                    POST /api/wechat-events/refresh
+                  </code>{" "}
+                  单独重跑抽取。
+                </p>
+              </div>
+            ) : (
+              <p className="text-sm">
+                该分类下暂无内容，换个分类或点击顶部右侧圆形刷新试试
+              </p>
+            )}
           </div>
         ) : (
           <>

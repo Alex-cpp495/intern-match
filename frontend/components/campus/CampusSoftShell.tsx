@@ -102,15 +102,17 @@ export function CampusSoftShell({
 
             <button
               type="button"
-              title="刷新当前视图"
+              title="刷新数据（官网+Careers+微信文章+公众号活动AI）"
+              aria-label="刷新校园数据"
               onClick={onRefresh}
               disabled={refreshing}
-              className="ml-auto p-2.5 rounded-full text-slate-400 hover:text-violet-600 hover:bg-white/55 hover:backdrop-blur-sm border border-transparent hover:border-stone-200/50 transition-colors disabled:opacity-40"
+              className="ml-auto inline-flex items-center gap-1.5 px-2 sm:px-3 py-2 rounded-full text-slate-500 hover:text-violet-600 hover:bg-white/55 hover:backdrop-blur-sm border border-stone-200/40 hover:border-violet-200/60 transition-colors disabled:opacity-40 text-xs sm:text-sm font-medium"
             >
               <RefreshCw
                 size={18}
-                className={refreshing ? "animate-spin" : ""}
+                className={refreshing ? "animate-spin shrink-0" : "shrink-0"}
               />
+              <span className="hidden sm:inline">刷新</span>
             </button>
           </div>
 

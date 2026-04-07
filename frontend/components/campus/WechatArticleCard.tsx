@@ -12,6 +12,7 @@ import {
 export interface WechatArticle {
   title: string;
   date: string;
+  publish_date?: string;
   summary: string;
   account: string;
   sogou_link: string;
@@ -30,14 +31,26 @@ const CARD_COLORS = [
   "from-indigo-100/55 to-violet-50/45 border-indigo-200/40",
 ] as const;
 
+/** 短时签名 mp 链几分钟就会失效，直开会显示连接无效，应走 open-sogou 解析 */
+function isShortLivedMpUrl(u: string): boolean {
+  if (!u || !u.includes("mp.weixin.qq.com")) return false;
+  return /[?&]src=11\b/.test(u) || /[?&]signature=/.test(u);
+}
+
 function resolveArticleUrl(article: WechatArticle): string {
-  if (article.sogou_link && article.sogou_link.includes("weixin.sogou.com")) {
+  if (article.sogou_link?.includes("weixin.sogou.com")) {
     return `/api/articles/open-sogou?url=${encodeURIComponent(article.sogou_link)}`;
   }
-  if (article.wechat_url && article.wechat_url.includes("mp.weixin.qq.com")) {
+  if (
+    article.wechat_url?.includes("mp.weixin.qq.com") &&
+    !isShortLivedMpUrl(article.wechat_url)
+  ) {
     return article.wechat_url;
   }
-  return article.sogou_link || "#";
+  if (article.sogou_link) {
+    return `/api/articles/open-sogou?url=${encodeURIComponent(article.sogou_link)}`;
+  }
+  return "#";
 }
 
 function resolveImgUrl(raw: string): string {
@@ -61,6 +74,8 @@ export function WechatArticleCard({
   const shell = CARD_COLORS[index % CARD_COLORS.length];
   const url = resolveArticleUrl(article);
   const imgSrc = resolveImgUrl(article.img_url);
+  // date 来自搜狗搜索结果，通常为空；publish_date 从文章 HTML 解析，更可靠
+  const displayDate = article.date || article.publish_date || "";
 
   return (
     <article
@@ -85,9 +100,9 @@ export function WechatArticleCard({
             <MessageCircle size={11} />
             公众号
           </span>
-          {article.date && (
+          {displayDate && (
             <span className="text-[11px] text-slate-500 shrink-0">
-              {article.date}
+              {displayDate}
             </span>
           )}
         </div>
