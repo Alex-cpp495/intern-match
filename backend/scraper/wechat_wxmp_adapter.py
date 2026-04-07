@@ -59,8 +59,11 @@ def _load_cookies() -> dict[str, str] | None:
         return None
 
 
-def _article_html_to_text(url: str) -> str:
-    """从微信文章 URL 获取纯文本正文。"""
+def _article_html_to_text_and_images(url: str) -> tuple[str, list[str]]:
+    """
+    从微信文章 URL 获取纯文本正文 + 图片 URL 列表。
+    返回 (text, image_urls)。
+    """
     try:
         headers = {
             "User-Agent": (
@@ -72,7 +75,7 @@ def _article_html_to_text(url: str) -> str:
         resp = requests.get(url, headers=headers, timeout=15)
         resp.encoding = "utf-8"
         if resp.status_code != 200:
-            return ""
+            return "", []
         soup = BeautifulSoup(resp.text, "lxml")
         content_el = (
             soup.select_one("#js_content")
@@ -80,16 +83,24 @@ def _article_html_to_text(url: str) -> str:
             or soup.select_one("article")
         )
         if not content_el:
-            return ""
+            return "", []
+
+        imgs = content_el.find_all("img")
+        image_urls = []
+        for img in imgs:
+            src = img.get("data-src") or img.get("src") or ""
+            if src and src.startswith("http"):
+                image_urls.append(src)
+
         for tag in content_el.find_all(["script", "style"]):
             tag.decompose()
         text = content_el.get_text("\n", strip=True)
         import re
         text = re.sub(r"\n{3,}", "\n\n", text)
-        return text[:300_000]
+        return text[:300_000], image_urls[:10]
     except Exception as e:
         logger.debug("获取文章正文失败 %s: %s", url[:60], e)
-        return ""
+        return "", []
 
 
 def _save_token(token: str) -> None:
@@ -275,8 +286,9 @@ def fetch_articles_via_wxmp(
                         pass
 
                 content = ""
+                image_urls: list[str] = []
                 if fetch_content and link:
-                    content = _article_html_to_text(link)
+                    content, image_urls = _article_html_to_text_and_images(link)
                     time.sleep(0.3)
 
                 article = {
@@ -289,6 +301,7 @@ def fetch_articles_via_wxmp(
                     "wechat_url": link,
                     "img_url": cover,
                     "content": content,
+                    "image_urls": image_urls,
                     "search_query": account_name,
                     "source": "wxmp",
                 }
