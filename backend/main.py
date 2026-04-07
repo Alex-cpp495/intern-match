@@ -31,13 +31,26 @@ async def lifespan(app: FastAPI):
         logger.info("已跳过启动时 embedding 预加载（SKIP_EMBEDDER_WARMUP=1），首次匹配时再加载模型")
     else:
         logger.info("预加载 sentence-transformers 模型...")
-        from core.embedder import get_model
+        try:
+            from core.embedder import get_model
 
-        get_model()
+            get_model()
+        except Exception:
+            logger.exception(
+                "启动时 embedding 预加载失败，进程继续运行；可设 SKIP_EMBEDDER_WARMUP=1 跳过，"
+                "或稍后访问 GET /api/warmup / 首次匹配时再加载模型"
+            )
+
     # 初始化岗位缓存（加载 UNNC 预置数据）
-    from scraper.shixiseng import get_all_jobs
-    jobs_list = get_all_jobs()
-    logger.info(f"已加载 {len(jobs_list)} 条岗位数据")
+    try:
+        from scraper.shixiseng import get_all_jobs
+
+        jobs_list = get_all_jobs()
+        logger.info("已加载 %d 条岗位数据", len(jobs_list))
+    except Exception:
+        logger.exception(
+            "启动时加载岗位数据失败，进程继续运行；岗位列表可能为空，可检查 jobs_cache 或 POST /api/jobs/refresh"
+        )
 
     # 每日定时全量爬取更新缓存（APScheduler，本地时间 03:00）
     scheduler = None
