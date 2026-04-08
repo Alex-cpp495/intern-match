@@ -260,8 +260,14 @@ def _wechat_event_to_calendar(e: dict) -> Optional[CalendarEvent]:
     date_end = (e.get("date_end") or date_start).strip()
     time_start = (e.get("time_start") or "").strip()
     time_end = (e.get("time_end") or "").strip()
+    wechat_url = (e.get("wechat_url") or "").strip()
     sogou = (e.get("sogou_link") or "").strip()
-    url = f"/api/articles/open-sogou?url={quote(sogou, safe='')}" if sogou else ""
+    if wechat_url:
+        url = wechat_url
+    elif sogou:
+        url = f"/api/articles/open-sogou?url={quote(sogou, safe='')}"
+    else:
+        url = ""
 
     cats_raw = e.get("categories")
     categories: list[str] = []
